@@ -1,50 +1,129 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { AppShell } from "@/components/AppShell";
+import { ClipboardPage } from "@/pages/ClipboardPage";
+import { LoginPage } from "@/pages/LoginPage";
+import { SettingsPage } from "@/pages/SettingsPage";
+import { SharePage } from "@/pages/SharePage";
+import { WatchPage } from "@/pages/WatchPage";
+import {
+  AppRoute,
+  AppSnapshot,
+  WatchSettings,
+  WatchedFolder,
+} from "@/types";
+
+const ROUTE_TITLES: Record<AppRoute, string> = {
+  clipboard: "Clipboard",
+  watch: "Watch List",
+  share: "Share",
+  settings: "Settings",
+};
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
+  const [route, setRoute] = useState<AppRoute>("clipboard");
+  const [error, setError] = useState<string | null>(null);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  const refresh = useCallback(async () => {
+    try {
+      const next = await invoke<AppSnapshot>("get_snapshot");
+      setSnapshot(next);
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function applySnapshot(action: () => Promise<AppSnapshot>) {
+    const next = await action();
+    setSnapshot(next);
+    setError(null);
+    return next;
+  }
+
+  if (!snapshot) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 bg-background text-foreground">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+        {error && (
+          <p className="max-w-sm px-4 text-center text-xs text-destructive">
+            {error}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (!snapshot.authenticated) {
+    return (
+      <LoginPage
+        onAuthenticated={(next) => {
+          setSnapshot(next);
+          setRoute("clipboard");
+        }}
+      />
+    );
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <AppShell
+      route={route}
+      onRouteChange={setRoute}
+      title={ROUTE_TITLES[route]}
+    >
+      {route === "clipboard" && <ClipboardPage snapshot={snapshot} />}
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+      {route === "watch" && (
+        <WatchPage
+          snapshot={snapshot}
+          onChange={(watch: WatchSettings, folders: WatchedFolder[]) => {
+            setSnapshot({
+              ...snapshot,
+              watch,
+              watched_folders: folders,
+            });
+            void applySnapshot(() =>
+              invoke<AppSnapshot>("update_watch_settings", {
+                args: { watch, folders },
+              }),
+            ).catch((err) => setError(String(err)));
+          }}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      )}
+
+      {route === "share" && (
+        <SharePage
+          snapshot={snapshot}
+          onRegisterPeer={async (peerId, multiaddr) => {
+            await applySnapshot(() =>
+              invoke<AppSnapshot>("register_peer", {
+                args: {
+                  peerId,
+                  multiaddr,
+                  linkLocalDevice: false,
+                },
+              }),
+            );
+          }}
+        />
+      )}
+
+      {route === "settings" && (
+        <SettingsPage
+          snapshot={snapshot}
+          onSnapshot={setSnapshot}
+          onLogout={async () => {
+            const next = await invoke<AppSnapshot>("logout");
+            setSnapshot(next);
+          }}
+        />
+      )}
+    </AppShell>
   );
 }
 

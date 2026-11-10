@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./macos.css";
+
+@layer base {
+  html,
+  body,
+  #root {
+    @apply h-full overflow-hidden;
+  }
+}

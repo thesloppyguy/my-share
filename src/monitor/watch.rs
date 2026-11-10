@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -12,9 +13,12 @@ use crate::models::watch::{WatchEvent, WatchEventKind, WatchSettings, WatchedFol
 ///
 /// Call [`FolderMonitor::drain_events`] from a timer / async loop to collect
 /// changes, then persist them through the store.
+///
+/// The receiver is wrapped in a [`Mutex`] so [`FolderMonitor`] is `Sync` and can
+/// live inside async/`&self` state used by the Tauri platform layer.
 pub struct FolderMonitor {
     _watcher: RecommendedWatcher,
-    rx: Receiver<Result<Event, notify::Error>>,
+    rx: Mutex<Receiver<Result<Event, notify::Error>>>,
     ignored: HashSet<String>,
 }
 
@@ -41,7 +45,7 @@ impl FolderMonitor {
 
         Ok(Self {
             _watcher: watcher,
-            rx,
+            rx: Mutex::new(rx),
             ignored: settings.ignored.iter().cloned().collect(),
         })
     }
@@ -49,8 +53,9 @@ impl FolderMonitor {
     /// Non-blocking drain of pending filesystem events.
     pub fn drain_events(&self) -> Result<Vec<WatchEvent>, MonitorError> {
         let mut events = Vec::new();
+        let rx = self.rx.lock().expect("folder monitor receiver lock");
 
-        while let Ok(message) = self.rx.try_recv() {
+        while let Ok(message) = rx.try_recv() {
             let event = message?;
             events.extend(map_notify_event(event, &self.ignored));
         }

@@ -8,6 +8,7 @@ use crate::errors::StoreError;
 use crate::models::account::Account;
 use crate::models::clipboard::ClipboardEntry;
 use crate::models::device::Device;
+use crate::models::peer::{Peer, PeerAddress, PeerRegistry};
 use crate::models::watch::{WatchEvent, WatchedFolder};
 use crate::time_util::{system_time_from_millis, system_time_to_millis};
 
@@ -75,6 +76,41 @@ impl Store {
     }
 
     // ----------------------------------
+    // Auth session
+    // ----------------------------------
+
+    pub async fn load_auth_session(&self) -> Result<Option<(String, bool)>, StoreError> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT email, logged_in FROM auth_session WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(email, logged_in)| (email, logged_in != 0)))
+    }
+
+    pub async fn save_auth_session(&self, email: &str, logged_in: bool) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO auth_session (id, email, logged_in) VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               email = excluded.email,
+               logged_in = excluded.logged_in",
+        )
+        .bind(email)
+        .bind(logged_in as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_auth_session(&self) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM auth_session WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ----------------------------------
     // Devices
     // ----------------------------------
 
@@ -115,6 +151,100 @@ impl Store {
         rows.into_iter()
             .map(|(payload,)| Ok(serde_json::from_str(&payload)?))
             .collect()
+    }
+
+    // ----------------------------------
+    // Peer registry (persistent subset)
+    // ----------------------------------
+
+    /// Load devices / peers / addresses / device↔peer links into a registry.
+    /// Connections are runtime-only and start empty.
+    pub async fn load_peer_registry(&self) -> Result<PeerRegistry, StoreError> {
+        let mut registry = PeerRegistry::default();
+
+        for device in self.list_devices().await? {
+            registry.upsert_device(device);
+        }
+
+        let peer_rows: Vec<(String,)> = sqlx::query_as("SELECT payload FROM peers")
+            .fetch_all(&self.pool)
+            .await?;
+        for (payload,) in peer_rows {
+            let peer: Peer = serde_json::from_str(&payload)?;
+            registry.upsert_peer(peer);
+        }
+
+        let addr_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT peer_id, payload FROM peer_addresses")
+                .fetch_all(&self.pool)
+                .await?;
+        for (peer_id, payload) in addr_rows {
+            let address: PeerAddress = serde_json::from_str(&payload)?;
+            registry.upsert_address(peer_id, address);
+        }
+
+        let link_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT device_id, peer_id FROM device_peers")
+                .fetch_all(&self.pool)
+                .await?;
+        for (device_id, peer_id) in link_rows {
+            registry.link_device_peer(device_id, peer_id);
+        }
+
+        Ok(registry)
+    }
+
+    pub async fn upsert_peer(&self, peer: &Peer) -> Result<(), StoreError> {
+        let payload = serde_json::to_string(peer)?;
+        sqlx::query(
+            "INSERT INTO peers (peer_id, payload, updated_at)
+             VALUES (?, ?, strftime('%s','now'))
+             ON CONFLICT(peer_id) DO UPDATE SET
+               payload = excluded.payload,
+               updated_at = excluded.updated_at",
+        )
+        .bind(&peer.peer_id)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_peer_address(
+        &self,
+        peer_id: &str,
+        address: &PeerAddress,
+    ) -> Result<(), StoreError> {
+        let payload = serde_json::to_string(address)?;
+        sqlx::query(
+            "INSERT INTO peer_addresses (peer_id, multiaddr, payload)
+             VALUES (?, ?, ?)
+             ON CONFLICT(peer_id, multiaddr) DO UPDATE SET
+               payload = excluded.payload",
+        )
+        .bind(peer_id)
+        .bind(&address.multiaddr)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn link_device_peer(
+        &self,
+        device_id: &str,
+        peer_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO device_peers (device_id, peer_id)
+             VALUES (?, ?)
+             ON CONFLICT(device_id, peer_id) DO NOTHING",
+        )
+        .bind(device_id)
+        .bind(peer_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ----------------------------------
@@ -503,5 +633,36 @@ mod tests {
         let account = store.load_account().await.unwrap();
         assert_eq!(account, Account::default());
         assert_eq!(account.settings, Settings::default());
+    }
+
+    #[tokio::test]
+    async fn peer_registry_round_trip() {
+        use crate::models::peer::{DiscoverySource, Peer, PeerAddress};
+
+        let (_dir, store) = temp_store().await;
+        let local = Device {
+            id: "local-1".into(),
+            name: "MacBook".into(),
+            hardware: Hardware::Computer,
+            platform: Platform::MacOs,
+            app_version: "0.1.0".into(),
+        };
+        store.save_local_device(&local).await.unwrap();
+
+        let peer = Peer::new("peer-abc");
+        store.upsert_peer(&peer).await.unwrap();
+        store
+            .upsert_peer_address(
+                "peer-abc",
+                &PeerAddress::new("/ip4/10.0.0.2/tcp/4001", DiscoverySource::Manual),
+            )
+            .await
+            .unwrap();
+        store.link_device_peer("local-1", "peer-abc").await.unwrap();
+
+        let registry = store.load_peer_registry().await.unwrap();
+        assert!(registry.peers.contains_key("peer-abc"));
+        assert_eq!(registry.addresses.get("peer-abc").unwrap().len(), 1);
+        assert_eq!(registry.peers_for_device("local-1").len(), 1);
     }
 }

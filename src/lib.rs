@@ -6,5 +6,6 @@ pub mod state;
 pub mod store;
 mod time_util;
 
-pub use state::AppState;
+pub use models::peer::PeerRegistry;
+pub use state::{AppSnapshot, AppState, ClipboardEntryView, OtpChallenge};
 pub use store::Store;
