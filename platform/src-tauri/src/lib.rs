@@ -28,7 +28,7 @@ async fn request_otp(
     args: RequestOtpArgs,
 ) -> Result<my_share::OtpChallenge, String> {
     let mut guard = state.0.lock().await;
-    guard.request_otp(args.email)
+    guard.request_otp(args.email).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +166,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // Prefer repo-root .env during `tauri dev`; ignore if missing.
+            let _ = dotenvy::from_filename("../.env");
+            let _ = dotenvy::from_filename("../../.env");
+            let _ = dotenvy::dotenv();
+
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("my-share.db");

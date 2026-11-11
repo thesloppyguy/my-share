@@ -32,6 +32,11 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         version = 3;
         set_schema_version(pool, false, version).await?;
     }
+    if version < 4 {
+        migrate_v4(pool).await?;
+        version = 4;
+        set_schema_version(pool, false, version).await?;
+    }
 
     let _ = version;
     Ok(())
@@ -173,6 +178,21 @@ async fn migrate_v3(pool: &SqlitePool) -> Result<(), StoreError> {
     )
     .execute(pool)
     .await?;
+
+    Ok(())
+}
+
+async fn migrate_v4(pool: &SqlitePool) -> Result<(), StoreError> {
+    // Expand local login session with registry token fields.
+    let _ = sqlx::query("ALTER TABLE auth_session ADD COLUMN access_token TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE auth_session ADD COLUMN user_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE auth_session ADD COLUMN device_id TEXT")
+        .execute(pool)
+        .await;
 
     Ok(())
 }

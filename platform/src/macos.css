@@ -564,7 +564,7 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background font-sans text-mac-body text-foreground;
+    @apply bg-transparent font-sans text-mac-body text-foreground;
     /* Keep macOS's own text rendering, which matches native controls. */
     -webkit-font-smoothing: auto;
   }

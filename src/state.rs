@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{self, RegistryClient};
 use crate::errors::{MonitorError, StoreError};
 use crate::models::account::{Account, Profile, Settings};
 use crate::models::clipboard::{ClipboardContent, ClipboardEntry, ClipboardSettings};
@@ -12,13 +13,12 @@ use crate::models::peer::{
 };
 use crate::models::watch::{WatchEvent, WatchSettings, WatchedFolder};
 use crate::monitor::{ClipboardTracker, FolderMonitor};
-use crate::store::Store;
+use crate::store::{AuthSessionRecord, Store};
 use crate::time_util::system_time_to_millis;
 
 #[derive(Debug, Clone)]
 struct PendingOtp {
     email: String,
-    code: String,
     expires_at: Instant,
 }
 
@@ -30,9 +30,12 @@ pub struct AppState {
     pub watched_folders: Vec<WatchedFolder>,
     pub registry: PeerRegistry,
     pub authenticated: bool,
+    pub access_token: Option<String>,
+    pub user_id: Option<String>,
     clipboard: ClipboardTracker,
     folder_monitor: Option<FolderMonitor>,
     pending_otp: Option<PendingOtp>,
+    auth_client: RegistryClient,
 }
 
 impl AppState {
@@ -60,11 +63,17 @@ impl AppState {
             .await?;
         clipboard.seed_from_history(&history);
 
-        let authenticated = store
-            .load_auth_session()
-            .await?
-            .map(|(_, logged_in)| logged_in)
+        let auth_session = store.load_auth_session().await?;
+        let authenticated = auth_session
+            .as_ref()
+            .map(|session| session.logged_in && session.access_token.is_some())
             .unwrap_or(false);
+        let access_token = auth_session
+            .as_ref()
+            .and_then(|session| session.access_token.clone());
+        let user_id = auth_session
+            .as_ref()
+            .and_then(|session| session.user_id.clone());
 
         Ok(Self {
             store,
@@ -73,9 +82,12 @@ impl AppState {
             watched_folders,
             registry,
             authenticated,
+            access_token,
+            user_id,
             clipboard,
             folder_monitor: None,
             pending_otp: None,
+            auth_client: RegistryClient::from_env(),
         })
     }
 
@@ -207,25 +219,26 @@ impl AppState {
         self.registry.snapshot()
     }
 
-    /// Start email OTP login. Returns a development code until a mail provider is wired.
-    pub fn request_otp(&mut self, email: impl Into<String>) -> Result<OtpChallenge, String> {
+    /// Start email OTP login via the hosted registry.
+    pub async fn request_otp(
+        &mut self,
+        email: impl Into<String>,
+    ) -> Result<OtpChallenge, String> {
         let email = email.into().trim().to_lowercase();
         if !email.contains('@') || email.len() < 5 {
             return Err("Enter a valid email address".into());
         }
 
-        let code = format!("{:06}", (uuid::Uuid::new_v4().as_u128() % 1_000_000) as u32);
+        let response = self.auth_client.request_otp(&email).await?;
         self.pending_otp = Some(PendingOtp {
             email: email.clone(),
-            code: code.clone(),
-            expires_at: Instant::now() + Duration::from_secs(10 * 60),
+            expires_at: Instant::now() + Duration::from_secs(response.expires_in_sec.max(60)),
         });
 
         Ok(OtpChallenge {
             email,
-            expires_in_secs: 600,
-            // Local-first placeholder until SMTP / provider is connected.
-            dev_code: Some(code),
+            expires_in_secs: response.expires_in_sec,
+            dev_code: None,
         })
     }
 
@@ -249,18 +262,33 @@ impl AppState {
         if pending.email != email {
             return Err("Email does not match the pending OTP request.".into());
         }
-        if pending.code != code {
-            return Err("Invalid code.".into());
-        }
+
+        let fingerprint = auth::device_fingerprint(&format!(
+            "{}|{}|{}",
+            self.local_device.id,
+            std::env::consts::OS,
+            self.store.path().display()
+        ));
+        // Stable stand-in until the libp2p identity is wired into auth.
+        let peer_id = self.local_device.id.clone();
+        let verified = self
+            .auth_client
+            .verify_otp(
+                &email,
+                &code,
+                &self.local_device.name,
+                &fingerprint,
+                &peer_id,
+                &[],
+                std::env::consts::OS,
+            )
+            .await?;
 
         self.pending_otp = None;
-        if self.account.profile.email.is_empty() {
-            self.account.profile.email = email.clone();
-        } else {
-            self.account.profile.email = email.clone();
-        }
+        self.account.profile.email = verified.email.clone();
         if self.account.profile.name.is_empty() {
-            self.account.profile.name = email
+            self.account.profile.name = verified
+                .email
                 .split('@')
                 .next()
                 .unwrap_or("User")
@@ -268,9 +296,17 @@ impl AppState {
         }
         self.save_account().await.map_err(|e| e.to_string())?;
         self.store
-            .save_auth_session(&email, true)
+            .save_auth_session(&AuthSessionRecord {
+                email: verified.email.clone(),
+                logged_in: true,
+                access_token: Some(verified.access_token.clone()),
+                user_id: Some(verified.user_id.clone()),
+                device_id: Some(verified.device_id.clone()),
+            })
             .await
             .map_err(|e| e.to_string())?;
+        self.access_token = Some(verified.access_token);
+        self.user_id = Some(verified.user_id);
         self.authenticated = true;
         Ok(())
     }
@@ -278,6 +314,8 @@ impl AppState {
     pub async fn logout(&mut self) -> Result<(), StoreError> {
         self.pending_otp = None;
         self.authenticated = false;
+        self.access_token = None;
+        self.user_id = None;
         self.store.clear_auth_session().await
     }
 
@@ -305,7 +343,7 @@ impl AppState {
 pub struct OtpChallenge {
     pub email: String,
     pub expires_in_secs: u64,
-    /// Present while email delivery is not configured.
+    /// Only present for local/dev auth backends.
     pub dev_code: Option<String>,
 }
 

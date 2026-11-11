@@ -12,6 +12,16 @@ use crate::models::peer::{Peer, PeerAddress, PeerRegistry};
 use crate::models::watch::{WatchEvent, WatchedFolder};
 use crate::time_util::{system_time_from_millis, system_time_to_millis};
 
+/// Persisted login session from the hosted registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSessionRecord {
+    pub email: String,
+    pub logged_in: bool,
+    pub access_token: Option<String>,
+    pub user_id: Option<String>,
+    pub device_id: Option<String>,
+}
+
 /// Durable SQLite-backed state that survives process restarts.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -79,25 +89,42 @@ impl Store {
     // Auth session
     // ----------------------------------
 
-    pub async fn load_auth_session(&self) -> Result<Option<(String, bool)>, StoreError> {
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT email, logged_in FROM auth_session WHERE id = 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn load_auth_session(&self) -> Result<Option<AuthSessionRecord>, StoreError> {
+        let row: Option<(String, i64, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT email, logged_in, access_token, user_id, device_id
+                 FROM auth_session WHERE id = 1",
+            )
+            .fetch_optional(&self.pool)
+            .await?;
 
-        Ok(row.map(|(email, logged_in)| (email, logged_in != 0)))
+        Ok(row.map(
+            |(email, logged_in, access_token, user_id, device_id)| AuthSessionRecord {
+                email,
+                logged_in: logged_in != 0,
+                access_token,
+                user_id,
+                device_id,
+            },
+        ))
     }
 
-    pub async fn save_auth_session(&self, email: &str, logged_in: bool) -> Result<(), StoreError> {
+    pub async fn save_auth_session(&self, session: &AuthSessionRecord) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO auth_session (id, email, logged_in) VALUES (1, ?, ?)
+            "INSERT INTO auth_session (id, email, logged_in, access_token, user_id, device_id)
+             VALUES (1, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                email = excluded.email,
-               logged_in = excluded.logged_in",
+               logged_in = excluded.logged_in,
+               access_token = excluded.access_token,
+               user_id = excluded.user_id,
+               device_id = excluded.device_id",
         )
-        .bind(email)
-        .bind(logged_in as i64)
+        .bind(&session.email)
+        .bind(session.logged_in as i64)
+        .bind(&session.access_token)
+        .bind(&session.user_id)
+        .bind(&session.device_id)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -6,6 +6,6 @@
   html,
   body,
   #root {
-    @apply h-full overflow-hidden;
+    @apply h-full overflow-hidden bg-transparent;
   }
 }
